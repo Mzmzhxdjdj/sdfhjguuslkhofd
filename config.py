@@ -6,7 +6,7 @@
 import os
 
 # توکن ربات تلگرام
-BOT_TOKEN = "8885136415:AAE1JwRZajqfSeU3yzl01JIwbyMQUecDV24"
+BOT_TOKEN = "8885136415:AAEoWyaNfnUDGlTnckhBt0WDYwO1mDSpYOM"
 
 # پورت سرور (از متغیر محیطی یا پیش‌فرض 8000)
 PORT = int(os.getenv("PORT", 8000))
